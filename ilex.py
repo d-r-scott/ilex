@@ -41,6 +41,7 @@ class FRB(object):
             nchan: int = 336,
             memmap: bool = True,
             crop: bool = True,
+            crop_dur: float = 10.0,
             basic: bool = False,
             download_all_DMs: bool = False,
             get_crops: bool = False,
@@ -50,6 +51,7 @@ class FRB(object):
         self.verbose = verbose
         self.memmap = memmap
         self.crop = crop
+        self.crop_dur = crop_dur
         self.data_dir = f"{data_base}{name}/"
         self.htr_dir = f"{self.data_dir}htr/"
         self.config = None
@@ -138,14 +140,16 @@ class FRB(object):
             ]):
             print(f"Some data could not be loaded for {self.name}")
             print("Try running FRB.download_data() and FRB.load_data()")
-        
+
+
         if self.crop:
             self.apply_crop()
 
+        # if self.favg > 1 or self.tavg > 1:
+        self.set_dt_df(self.tavg, self.favg)
+
         if self.nchan != 336:
             self.set_dynspec_nchan(self.nchan)
-
-        self.set_dt_df(self.tavg, self.favg)
 
         if self.zap_above_crossing_freq:
             self.set_crossing_freq()
@@ -155,12 +159,18 @@ class FRB(object):
         else:
             self.crossing_freq = np.inf
 
+
+
         if self.verbose:
             print(f"Loaded data for {self.name}")
             self.data_status()
 
     def get_config(self):
         # Check if we have the config file, if not then try to download it
+        if not os.path.isdir(self.data_dir):
+            if self.verbose:
+                print(f"Creating data dir for {self.name}")
+            os.mkdir(self.data_dir)
         if not os.path.isfile(f"{self.data_dir}{self.name}.config"):
             if self.verbose:
                 print(f"Could not find config file for {self.name}")
@@ -232,30 +242,30 @@ class FRB(object):
             #     )
 
             # with SCPClient(ssh.get_transport(), progress=progress) as scp:
-        pars = "I" if self.basic else "xyXYIQUV"
+        pars = "*_I_*" if self.basic else "*"
         DMstr = self.DM if not self.download_all_DMs else ""
-        for p in pars:
-            get_fn = f"/fred/oz002/askap/craft/craco/processing/output/{self.name}/htr/*_{p}_*{DMstr}.npy"
-            to_fn = self.htr_dir
-            if self.verbose:
-                print(f"Downloading {get_fn} to {to_fn}")
+        get_fn = f"/fred/oz002/askap/craft/craco/processing/output/{self.name}/htr/{pars}{DMstr}.npy"
+        to_fn = f"{self.htr_dir}/"
+        if self.verbose:
+            print(f"Downloading {get_fn} to {to_fn}")
 
-            try:
-                # scp.get(
-                #     get_fn,
-                #     to_fn,
-                #     recursive=True,
-                # )
-                sysrsync.run(
-                    source=get_fn,
-                    source_ssh="dscott@ozstar.swin.edu.au",
-                    destination=to_fn,
-                    sync_source_contents=False,
-                    verbose=self.verbose
-                )
-            except Exception as e:
-                print(e)
-                print(f"Could not download {get_fn}, continuing")
+        try:
+            # scp.get(
+            #     get_fn,
+            #     to_fn,
+            #     recursive=True,
+            # )
+            sysrsync.run(
+                source=get_fn,
+                source_ssh="dscott@ozstar.swin.edu.au",
+                destination=to_fn,
+                sync_source_contents=False,
+                verbose=self.verbose,
+                options=["--progress"]
+            )
+        except Exception as e:
+            print(e)
+            print(f"Could not download {get_fn}, continuing")
     
     def load_data(self):
         # Load the data
@@ -263,7 +273,7 @@ class FRB(object):
             self.DM = self.get_DM()
         
         # Load time series
-        for p in "XYIQUV":
+        for p in "XYIQUV" if not self.basic else "I":
             fnames = glob(f"{self.htr_dir}{self.name}*_{p}_t_{self.DM}.npy")
 
             if not fnames:
@@ -285,7 +295,7 @@ class FRB(object):
             setattr(self, f"{p}_all", data)
 
         # Load dynamic spectra (setting first axis to time)
-        for p in "xyXYIQUV":
+        for p in "xyXYIQUV"if not self.basic else "I":
             fnames = glob(f"{self.htr_dir}{self.name}*_{p}_dynspec_{self.DM}.npy")
 
             if not fnames:
@@ -331,10 +341,10 @@ class FRB(object):
 
         if len(DMs) > 1:
             print(f"Found multiple DMs for {self.name}: {DMs}")
-            print("Using the first DM. To override, provide DM to FRB "
+            print("Using the config DM. To override, provide DM to FRB "
                   "constructor.")
 
-        return DMs[0]
+        return self.config["dm_frb"]
     
     def data_status(self):
         # Print status of data
@@ -366,25 +376,24 @@ class FRB(object):
         )
     
     # Data manipulation
-    def apply_crop(self):
-        # Crop data to 100 ms around peak
+    def apply_crop(self, force_peak=None):
+        # Crop data around peak
 
+        if force_peak is None:
         # Find rough peak
-        rough_peak = np.argmax(
-            scrunch(self.I_full, 336*1000, verbose=self.verbose)
-        )
+            rough_peak = np.argmax(
+                scrunch(self.I_ds_full.sum(axis=1), 1000, verbose=self.verbose)
+            )
+        else:
+            rough_peak = force_peak
 
-        # time_series_slice = slice(
-        #     (rough_peak-50)*336*1000, (rough_peak+50)*336*1000
-        # )
-        # dynspec_slice = slice(
-        #     (rough_peak-50)*1000*(336//self.nchan), (rough_peak+50)*1000*(336//self.nchan)
-        # )
         time_series_slice = slice(
-            (rough_peak-5)*336*1000, (rough_peak+5)*336*1000
+            int((rough_peak-self.crop_dur/2)*336*1000), 
+            int((rough_peak+self.crop_dur/2)*336*1000)
         )
         dynspec_slice = slice(
-            (rough_peak-5)*1000*(336//self.nchan), (rough_peak+5)*1000*(336//self.nchan)
+            int((rough_peak-self.crop_dur/2)*1000*(336//self.nchan)), 
+            int((rough_peak+self.crop_dur/2)*1000*(336//self.nchan))
         )
         self.crop_time = [dynspec_slice.start, dynspec_slice.stop]
 
@@ -400,7 +409,7 @@ class FRB(object):
                 setattr(
                     self, 
                     f"{p}_full", 
-                    getattr(self, f"{p}_full")[time_series_slice]
+                    getattr(self, f"{p}_all")[time_series_slice]
                 )
             
         # Crop dynamic spectra
@@ -411,7 +420,7 @@ class FRB(object):
                 setattr(
                     self, 
                     f"{p}_ds_full", 
-                    getattr(self, f"{p}_ds_full")[dynspec_slice]
+                    getattr(self, f"{p}_ds_all")[dynspec_slice]
                 )
         
     def set_dt(self, tavg, update_plots=True):
@@ -434,8 +443,8 @@ class FRB(object):
 
         tscrunch = lambda x, n: np.sqrt(n) * (
             scrunch(x, n, verbose=self.verbose, func=np.mean)
-            - np.mean(x)
-        ) / np.std(x)
+            # - np.mean(x)
+        ) #/ np.std(x)
 
         fscrunch = lambda x, n: scrunch(
             x, n, axis=1, verbose=self.verbose, func=np.mean
@@ -462,9 +471,6 @@ class FRB(object):
                         favg
                     )
                 )
-        
-        if self.crossing_freq is not None and self.zap_above_crossing_freq:
-            self.zap_above_freq(self.crossing_freq)
 
         for p in "XYIQUV":
             # time series - time only
@@ -500,6 +506,10 @@ class FRB(object):
 
         self.set_freqs()
         self.set_peak()
+        
+        if self.crossing_freq is not None and self.zap_above_crossing_freq:
+            self.zap_above_freq(self.crossing_freq)
+
         if self.Q is not None and self.U is not None:
             self.set_L()
 
@@ -569,15 +579,15 @@ class FRB(object):
             "V": new_V_ds,
         }
 
-        for p in "XYIQUV":
-            np.save(
-                f"{self.htr_dir}{self.name}_{p}_t_{new_DM}.npy",
-                new_time_series[p]
-            )
-            np.save(
-                f"{self.htr_dir}{self.name}_{p}_dynspec_{new_DM}.npy",
-                new_dynspec[p]
-            )
+        # for p in "XYIQUV":
+        #     np.save(
+        #         f"{self.htr_dir}{self.name}_{p}_t_{new_DM}.npy",
+        #         new_time_series[p]
+        #     )
+        #     np.save(
+        #         f"{self.htr_dir}{self.name}_{p}_dynspec_{new_DM}.npy",
+        #         new_dynspec[p]
+        #     )
         
         
         # update attributes
@@ -644,8 +654,20 @@ class FRB(object):
         # find the frequency at which the FRB falls out of the data
         # (i.e. the crossing frequency)
         k_DM = 2.41e-4  #pc cm^-3 GHz^-2 us^-2
+
+        # Find rough peak
+        rough_peak_100us = np.argmax(
+            scrunch(self.I_ds_all.sum(axis=1), 100, verbose=self.verbose)
+        )
+
+        # if self.crop:
+        #     self.crossing_freq = (
+        #         np.min(self.freqs/1e3)**(-2) - k_DM/float(self.DM) * (self.t[self.peak]+(self.crop_time[0])) 
+        #     )**(-0.5)*1e3
+        # else:
         self.crossing_freq = (
-            np.min(self.freqs/1e3)**(-2) - k_DM/float(self.DM) * (self.t[self.peak]+self.crop_time[0]) 
+            # np.min(self.freqs/1e3)**(-2) - k_DM/float(self.DM) * (self.t[self.peak]-self.t[0]) 
+            np.min(self.freqs/1e3)**(-2) - k_DM/float(self.DM) * rough_peak_100us*100
         )**(-0.5)*1e3
 
         if self.verbose:
@@ -657,10 +679,12 @@ class FRB(object):
             print(f"Zapping data above {zap_freq:.2f} MHz")
 
         for p in "XYIQUV":
-            if getattr(self, f"{p}_ds") is None:
-                continue
-            else:
-                getattr(self, f"{p}_ds")[:, self.freqs > zap_freq] = np.nan
+            for suf in ["_ds"]:
+                if getattr(self, f"{p}{suf}") is None:
+                    continue
+                else:
+                    # if any of the channel is above the crossing freq, zap
+                    getattr(self, f"{p}{suf}")[:, self.freqs+self.df/2 > zap_freq] = np.nan
         
     # Plotting
     def plot(
@@ -671,6 +695,7 @@ class FRB(object):
             xlabel="Time (ms)", 
             title=True,
             xlim=None,
+            legend=True,
             **kwargs
         ):
         """Plot PA, time series, and I dynamic spectrum
@@ -690,10 +715,13 @@ class FRB(object):
         elif axes is None:
             fig = ax.get_figure()
             div = make_axes_locatable(ax)
-            ax_p = div.append_axes("top", 1, pad=0.1, sharex=ax)
-            ax_s = div.append_axes("middle", 1, pad=0.1, sharex=ax)
-            ax_d = div.append_axes("bottom", 1, pad=0.1, sharex=ax)
+            ax_p = div.append_axes("top", size="50%", pad=0, sharex=ax)
+            ax_s = ax#div.append_axes("top", 1, pad=0.1, sharex=ax)
+            ax_d = div.append_axes("bottom", size="100%", pad=0, sharex=ax)
             axes = {"P": ax_p, "S": ax_s, "D": ax_d}
+
+            ax_p.set_xticks([])
+            ax_s.set_xticks([])
         else:
             fig = axes["P"].get_figure()
 
@@ -703,7 +731,7 @@ class FRB(object):
 
 
         self.plot_PA(axes["P"], xlabel=None, title=title, **kwargs)
-        self.plot_time_series(axes["S"], xlabel=None, title=False, **kwargs)
+        self.plot_time_series(axes["S"], xlabel=None, title=False, legend=legend, **kwargs)
         self.plot_dynspec(axes["D"], xlabel=xlabel, title=False, **kwargs)
 
         if xlim is None:
@@ -762,7 +790,7 @@ class FRB(object):
         if ylabel is not None:
             ax.set_ylabel(ylabel)
 
-        if title:
+        if title is not str:
             namestr = f"FRB{self.name}"
             dtstr = f"\mathrm{{dt}}={self.dt}\,\mathrm{{\mu s}}"
             dfstr = f"\mathrm{{df}}={self.df}\,\mathrm{{MHz}}"
@@ -770,6 +798,8 @@ class FRB(object):
             ax.set_title(
                 rf"{namestr}$^{{{dtstr}~|~{dfstr}}}_{{{DMstr}}}$"
             )
+        elif title:
+            ax.set_title(title)
 
         return fig, ax
 
@@ -780,6 +810,7 @@ class FRB(object):
             ylabel=r"Flux density ($\sigma$)",
             title=True,
             legend=True,
+            pars="IQUV",
             **kwargs
         ):
         """Plot time series
@@ -795,7 +826,7 @@ class FRB(object):
         # time axis
         t = (self.t)/1e3
 
-        for i, p in enumerate("IQUV"):
+        for i, p in enumerate(pars):
             if getattr(self, p) is None:
                 continue
             ax.step(
@@ -813,7 +844,7 @@ class FRB(object):
         if ylabel is not None:
             ax.set_ylabel(ylabel)
         if title:
-            ax.set_title(f"FRB{self.name} [dt={self.tavg} μs]")
+            ax.set_title(fr"{self.name} [dt={self.tavg} $\mu$s]")
         if legend:
             ax.legend()
 
@@ -823,7 +854,7 @@ class FRB(object):
             self,
             ax=None,
             xlabel="Time (ms)",
-            ylabel="Frequency (MHz)",
+            ylabel="Frequency (GHz)",
             title=True,
             p="I",
             cmap=dft_cmap,
@@ -842,10 +873,10 @@ class FRB(object):
         t_peak = self.t[self.peak]
 
         extent = [
-            (self.t[0])/1e3,
-            (self.t[-1])/1e3,
-            self.f0 - self.bw/2,
-            self.f0 + self.bw/2,
+            (self.t.min())/1e3,
+            (self.t.max())/1e3,
+            (self.f0 - self.bw/2)/1e3,
+            (self.f0 + self.bw/2)/1e3,
         ]
 
         if self.I_ds is not None:
@@ -858,9 +889,9 @@ class FRB(object):
                 **kwargs
             )
 
-        if self.crossing_freq < extent[3]:
-            ax.hlines([self.crossing_freq], *extent[:2], color="r", lw=1)
-            ax.set_ylim(None, self.crossing_freq)
+        # if self.crossing_freq/1e3 < extent[3]:
+        #     ax.hlines([self.crossing_freq/1e3], *extent[:2], color="r", lw=1)
+        #     ax.set_ylim(None, self.crossing_freq/1e3)
 
         if xlabel is not None:
             ax.set_xlabel(xlabel)
@@ -927,7 +958,7 @@ class FRB(object):
         cols = ["k", "b", "r"]
 
         I_err = np.std(self.I[self.off_burst])
-        L_err = np.std(self.L[self.off_burst])
+        L_err = np.std(self.L[self.off_bnp.loadrst])
         V_err = np.std(self.V[self.off_burst])
 
         # first ax: I, L, and V vs t
@@ -1358,9 +1389,47 @@ class FRB(object):
 
         self.PA = PA
         self.PA_err = PA_err
+    
+    def calc_RM(self, t_idx=None):
+        # calculate RM - adapted from method provided by Apurba Bera
+        t_idx = t_idx if t_idx else self.peak
+        noise_idx = self.I_ds[self.off_burst].shape[0]//2
+
+        rmtdata	= np.array(
+            [self.freqs*1e6,
+            self.I_ds[t_idx], 
+            self.Q_ds[t_idx], 
+            self.U_ds[t_idx], 
+            self.I_ds[noise_idx], 
+            self.Q_ds[noise_idx], 
+            self.Q_ds[noise_idx]]
+        )
+        
+        rmd, rmad = run_rmsynth(
+            rmtdata, polyOrd=3, phiMax_radm2=1.0e3, dPhi_radm2=1.0, nSamples=100.0,
+            weightType='variance', fitRMSF=False, noStokesI=False, 
+            phiNoise_radm2=1000000.0,
+            nBits=32, showPlots=self.verbose, debug=False, verbose=self.verbose, log=print, 
+            units='Jy/beam', prefixOut='prefixOut', saveFigures=None,
+            fit_function='log'
+        )
+        
+        rmc = run_rmclean(
+            rmd, rmad, 0.1, maxIter=1000, gain=0.1, nBits=32, showPlots=self.verbose, 
+            verbose=self.verbose, log=print
+        )
+        
+        print(rmc[0])
+        
+        res	= [
+            rmc[0]['phiPeakPIfit_rm2'], rmc[0]['dPhiPeakPIfit_rm2'], 
+            rmc[0]['polAngle0Fit_deg'], rmc[0]['dPolAngle0Fit_deg']
+        ]
+        
+        return(res)	
 
 
-@memory.cache
+# @memory.cache
 def scrunch(
         x: np.ndarray, n: int, axis: int=0, verbose: bool=False, func=np.sum
     ) -> np.ndarray:
@@ -1389,6 +1458,7 @@ def scrunch(
         raise ValueError("Invalid scrunch factor")
 
     if n == 1:
+        print("shorting")
         return x
     
     rem = x.shape[axis] % n
@@ -1603,45 +1673,6 @@ def get_norm(ds):
     stds = np.tile(np.std(ds, axis=0), [T, 1])
     return means, stds
 
-
-def calc_RM(self: FRB, t_idx=None):
-    # calculate RM - adapted from method provided by Apurba Bera
-    
-    t_idx = t_idx if t_idx else self.peak
-    noise_idx = self.I_ds[self.off_burst].shape[0]//2
-
-    rmtdata	= np.array(
-        [self.freqs*1e6,
-         self.I_ds[t_idx], 
-         self.Q_ds[t_idx], 
-         self.U_ds[t_idx], 
-         self.I_ds[noise_idx], 
-         self.Q_ds[noise_idx], 
-         self.Q_ds[noise_idx]]
-    )
-	
-    rmd, rmad = run_rmsynth(
-        rmtdata, polyOrd=3, phiMax_radm2=1.0e3, dPhi_radm2=1.0, nSamples=100.0,
-        weightType='variance', fitRMSF=False, noStokesI=False, 
-        phiNoise_radm2=1000000.0,
-		nBits=32, showPlots=self.verbose, debug=False, verbose=self.verbose, log=print, 
-        units='Jy/beam', prefixOut='prefixOut', saveFigures=None,
-        fit_function='log'
-    )
-	
-    rmc = run_rmclean(
-        rmd, rmad, 0.1, maxIter=1000, gain=0.1, nBits=32, showPlots=self.verbose, 
-        verbose=self.verbose, log=print
-    )
-	
-    print(rmc[0])
-	
-    res	= [
-        rmc[0]['phiPeakPIfit_rm2'], rmc[0]['dPhiPeakPIfit_rm2'], 
-        rmc[0]['polAngle0Fit_deg'], rmc[0]['dPolAngle0Fit_deg']
-    ]
-	
-    return(res)	
 
 
 def calculate_g2(I, Q, U, V, binwidth, verbose=False, mode="direct"):
