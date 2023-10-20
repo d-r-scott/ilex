@@ -22,10 +22,20 @@ import sysrsync
 from RMtools_1D.do_RMsynth_1D import run_rmsynth
 from RMtools_1D.do_RMclean_1D import run_rmclean
 from matplotlib import colors
+import ScintScatMethods as scint
+import astropy.units as un
+from rmnest.fit_RM import RMNest
+from scipy.optimize import curve_fit, minimize
+
 
 data_base = "/home/drscott/data/CELEBI/"
 memory = Memory(f"{data_base}cache", verbose=0)
-
+try:
+    ozstar_user = os.environ["OZSTAR_USER"]
+except KeyError:
+    print("WARNING: OZSTAR_USER environment variable not set.\n"
+          "You will not be able to download data from ozstar.")
+    ozstar_user = None
 
 dft_cmap = cmr.arctic_r
 
@@ -86,6 +96,7 @@ class FRB(object):
         self.t = None
         self.off_burst = None
         self.crossing_freq = None
+        self.flagged_chans = None
 
         self.dt = None
         self.df = None
@@ -184,7 +195,7 @@ class FRB(object):
         print(f"Downloading config file for {self.name} from ozstar")
         with SSHClient() as ssh:
             ssh.load_system_host_keys()
-            ssh.connect('ozstar.swin.edu.au', username='dscott')
+            ssh.connect('ozstar.swin.edu.au', username=ozstar_user)
 
             with SCPClient(ssh.get_transport()) as scp:
                 get_fn = f"/fred/oz002/askap/craft/craco/processing/configs/{self.name}.config"
@@ -230,18 +241,6 @@ class FRB(object):
     def download_data(self):
         # Download data from ozstar
         print(f"Downloading data for {self.name} from ozstar")
-        # with SSHClient() as ssh:
-        #     ssh.load_system_host_keys()
-        #     ssh.connect('ozstar.swin.edu.au', username='dscott')
-
-            # # Define progress callback that prints the current 
-            # # percentage completed for the file
-            # def progress(filename, size, sent):
-            #     sys.stdout.write(
-            #         f"{filename}: {float(sent)/float(size)*100:.2f}% \r"
-            #     )
-
-            # with SCPClient(ssh.get_transport(), progress=progress) as scp:
         pars = "*_I_*" if self.basic else "*"
         DMstr = self.DM if not self.download_all_DMs else ""
         get_fn = f"/fred/oz002/askap/craft/craco/processing/output/{self.name}/htr/{pars}{DMstr}.npy"
@@ -250,14 +249,9 @@ class FRB(object):
             print(f"Downloading {get_fn} to {to_fn}")
 
         try:
-            # scp.get(
-            #     get_fn,
-            #     to_fn,
-            #     recursive=True,
-            # )
             sysrsync.run(
                 source=get_fn,
-                source_ssh="dscott@ozstar.swin.edu.au",
+                source_ssh=f"{ozstar_user}@ozstar.swin.edu.au",
                 destination=to_fn,
                 sync_source_contents=False,
                 verbose=self.verbose,
@@ -272,6 +266,9 @@ class FRB(object):
         if self.DM is None:
             self.DM = self.get_DM()
         
+        if self.verbose:
+            print(f"Loading data for {self.name} at DM={self.DM}")
+
         # Load time series
         for p in "XYIQUV" if not self.basic else "I":
             fnames = glob(f"{self.htr_dir}{self.name}*_{p}_t_{self.DM}.npy")
@@ -465,12 +462,19 @@ class FRB(object):
                     f"{p}_ds", 
                     fscrunch(
                         tscrunch(
-                            getattr(self, f"{p}_ds_full"), 
+                            # roll so the peak is in the middle of the bin
+                            np.roll(getattr(self, f"{p}_ds_full"), tavg//2, axis=0), 
                             tavg
                         ),
                         favg
                     )
                 )
+
+        if self.crossing_freq is not None and self.zap_above_crossing_freq:
+            self.zap_above_freq(self.crossing_freq)
+        
+        if self.flagged_chans is not None:
+            self.flag_dynspec(self.flagged_chans)
 
         for p in "XYIQUV":
             # time series - time only
@@ -481,13 +485,15 @@ class FRB(object):
                     self, 
                     p,
                     tscrunch(
-                        getattr(self, f"{p}_full"), 
+                        np.roll(getattr(self, f"{p}_full"), tavg*self.nchan//2), 
                         tavg*self.nchan
                     )
                 )
                 if self.verbose and self.zap_above_crossing_freq:
                     print(f"WARNING: {p} time series may include data above crossing frequency")
             else:
+                if self.verbose:
+                    print(f"Getting {p} time series by summing over dynamic spectrum")
                 setattr(
                     self, 
                     p,
@@ -507,17 +513,15 @@ class FRB(object):
         self.set_freqs()
         self.set_peak()
         
-        if self.crossing_freq is not None and self.zap_above_crossing_freq:
-            self.zap_above_freq(self.crossing_freq)
-
-        if self.Q is not None and self.U is not None:
-            self.set_L()
 
         # define off-region window as time at least 40 ms from peak
         self.off_burst = np.logical_or(
             self.t < self.t[self.peak] - 40000,
             self.t > self.t[self.peak] + 40000
         )
+
+        if self.Q is not None and self.U is not None:
+            self.set_L()
 
         if self.axes is not None and update_plots:
             if isinstance(self.axes, dict):
@@ -535,9 +539,13 @@ class FRB(object):
 
     def set_L(self):
         self.L = np.sqrt(self.Q**2 + self.U**2)
+        self.L = self.L - np.mean(self.L[self.off_burst])
         self.L_ds = np.sqrt(self.Q_ds**2 + self.U_ds*2)
+        T, F = self.L_ds.shape
+        L_means = np.tile(np.nanmean(self.L_ds[self.off_burst], axis=0), (T, 1))
+        self.L_ds = self.L_ds - L_means
 
-    def dedisperse(self, new_DM: str):
+    def dedisperse(self, new_DM: str, normalise: bool = True):
         # dedisperse data to new_DM (in pc/cm3)
 
         if self.verbose:
@@ -568,7 +576,7 @@ class FRB(object):
         new_Y_ds = generate_dynspec(new_Y, verbose=self.verbose, label="Y")
 
         new_I_ds, new_Q_ds, new_U_ds, new_V_ds = calculate_stokes(
-            new_X_ds, new_Y_ds, delta_phi=None, verbose=self.verbose
+            new_X_ds, new_Y_ds, delta_phi=None, normalise=normalise, verbose=self.verbose
         )
         new_dynspec = {
             "X": new_X_ds,
@@ -600,7 +608,7 @@ class FRB(object):
             setattr(self, f"{p}_full", new_time_series[p])
             setattr(self, f"{p}_ds_full", new_dynspec[p])
         
-        self.load_data()
+        # self.load_data()
 
         self.set_dt_df(self.tavg, self.favg)
 
@@ -685,7 +693,93 @@ class FRB(object):
                 else:
                     # if any of the channel is above the crossing freq, zap
                     getattr(self, f"{p}{suf}")[:, self.freqs+self.df/2 > zap_freq] = np.nan
-        
+
+    def flag_dynspec(self, chans=None):
+        # interactively flag channels unless list of channels provided
+
+        flagged_chans = []
+
+        if chans is None:
+            plot_ds = self.I_ds.copy()
+
+            fig, ax = plt.subplots()
+
+            extent = [
+                (self.t.min())/1e3,
+                (self.t.max())/1e3,
+                (self.f0 - self.bw/2)/1e3,
+                (self.f0 + self.bw/2)/1e3,
+            ]
+
+            def draw(fig, ax):
+                ax.clear()
+                mask = np.ones_like(self.I_ds.T)
+                mask[flagged_chans] = np.nan
+                ax.imshow(
+                    plot_ds.T * mask,
+                    extent=extent,
+                    aspect="auto",
+                    interpolation="nearest",
+                    cmap=cmr.arctic_r,
+                )
+                fig.canvas.draw()
+
+            def on_click(event):
+                freq = event.ydata*1e3
+
+                # get channel index
+                chan = np.argmin(np.abs(self.freqs - freq))
+
+                print(freq, chan)
+
+                if chan in flagged_chans:
+                    flagged_chans.remove(chan)
+                else:
+                    flagged_chans.append(chan)
+
+                print(flagged_chans)
+
+                draw(fig, ax)
+
+            cid = fig.canvas.mpl_connect('button_press_event', on_click)
+            draw(fig, ax)
+
+            plt.show()
+        else:
+            flagged_chans = chans
+
+        if self.verbose:
+            print(f"Flagged channels: {sorted(flagged_chans)}")
+
+        self.flagged_chans = flagged_chans
+        for p in "IQUV":
+            getattr(self, f"{p}_ds")[:,flagged_chans] = np.nan
+
+    def de_RM(self, RM):
+        # correct dynamic spectra for Faraday rotation
+        lambda_sq = (3e8/(self.freqs*1e6))**2
+
+        psi_RM = RM * (lambda_sq - lambda_sq[0])
+        psi_RM = np.repeat(psi_RM, self.I_ds.shape[0]).reshape(self.I_ds.T.shape).T
+
+        Q_deRM = self.Q_ds * np.cos(2*psi_RM) + self.U_ds * np.sin(2*psi_RM)
+        U_deRM = -self.Q_ds * np.sin(2*psi_RM) + self.U_ds * np.cos(2*psi_RM)
+
+        # zero mean channels
+        T, F = Q_deRM.shape
+        Q_means = np.tile(np.nanmean(Q_deRM[self.off_burst], axis=0), (T, 1))
+        U_means = np.tile(np.nanmean(U_deRM[self.off_burst], axis=0), (T, 1))
+
+        Q_deRM -= Q_means
+        U_deRM -= U_means
+
+        self.Q_ds = Q_deRM
+        self.U_ds = U_deRM
+        self.Q = np.nansum(Q_deRM, axis=1)/np.sqrt(self.Q_ds.shape[1])
+        self.U = np.nansum(U_deRM, axis=1)/np.sqrt(self.U_ds.shape[1])
+
+        self.set_L()
+
     # Plotting
     def plot(
             self, 
@@ -957,16 +1051,16 @@ class FRB(object):
 
         cols = ["k", "b", "r"]
 
-        I_err = np.std(self.I[self.off_burst])
-        L_err = np.std(self.L[self.off_bnp.loadrst])
-        V_err = np.std(self.V[self.off_burst])
+        I_err = np.nanstd(self.I[self.off_burst])
+        L_err = np.nanstd(self.L[self.off_burst])
+        V_err = np.nanstd(self.V[self.off_burst])
 
         # first ax: I, L, and V vs t
         ax = axs[0]
         for i, p in enumerate("ILV"):
             ax.step(
                 t,
-                getattr(self, p),
+                getattr(self, p)/np.nanstd(getattr(self, p)[self.off_burst]),
                 where="mid",
                 lw=1,
                 label=p,
@@ -982,7 +1076,7 @@ class FRB(object):
         ax = axs[1]
         fracs = [self.L/self.I, self.V/self.I]
 
-        mask = (self.I > 5)
+        mask = (self.I/np.nanstd(self.I[self.off_burst]) > 5)
 
         t[~mask] = np.nan
         
@@ -1347,10 +1441,14 @@ class FRB(object):
         return MCFs
 
     def calc_PA(self):
-        # calculate and set the PA by method in Bhandari
+        # calculate and set the PA by method in Day+2020
         I = self.I
         Q = self.Q
         U = self.U
+
+        I = scrunch(
+            np.abs(self.X_full)**2 + np.abs(self.Y_full)**2, self.tavg*self.nchan
+        )
 
         # time axis
         t = self.t
@@ -1369,16 +1467,16 @@ class FRB(object):
         )/2
 
         L_meas = np.sqrt(Q**2 + U**2)
-        L_debias = np.sqrt((L_meas/I_err)**2 - I_err)
-        L_mask = (L_debias/I_err >= 1.57)
+        L_debias = I_err*np.sqrt((L_meas/I_err)**2 - 1)
+        L_mask = (L_meas/I_err >= 1.57)
         L_debias[~L_mask] = 0
-        PA_mask = (abs(I) > I_err) & (abs(Q) > Q_err) & (abs(U) > U_err) & (L_debias > 0)
+        # PA_mask = (abs(I) > I_err) & (L_debias > 0)
 
-        PA[~PA_mask] = np.nan
-        PA_err[~PA_mask] = np.nan
+        # PA[~PA_mask] = np.nan
+        # PA_err[~PA_mask] = np.nan
 
-        PA[off_burst] = np.nan
-        PA_err[off_burst] = np.nan
+        # PA[off_burst] = np.nan
+        # PA_err[off_burst] = np.nan
 
         # PA = np.unwrap(PA, discont=np.pi*2/3, period=np.pi)
 
@@ -1389,45 +1487,408 @@ class FRB(object):
 
         self.PA = PA
         self.PA_err = PA_err
+        self.L_debias = L_debias
     
-    def calc_RM(self, t_idx=None):
+    def calc_RM(self, t_idx=None, method="rmtools"):
         # calculate RM - adapted from method provided by Apurba Bera
         t_idx = t_idx if t_idx else self.peak
-        noise_idx = self.I_ds[self.off_burst].shape[0]//2
+        noise_idx = 1 #self.I_ds[self.off_burst].shape[0]//2
 
         rmtdata	= np.array(
             [self.freqs*1e6,
             self.I_ds[t_idx], 
             self.Q_ds[t_idx], 
             self.U_ds[t_idx], 
-            self.I_ds[noise_idx], 
-            self.Q_ds[noise_idx], 
-            self.Q_ds[noise_idx]]
+            np.std(self.I_ds[self.off_burst], axis=0),
+            np.std(self.Q_ds[self.off_burst], axis=0), 
+            np.std(self.Q_ds[self.off_burst], axis=0)]
         )
-        
-        rmd, rmad = run_rmsynth(
-            rmtdata, polyOrd=3, phiMax_radm2=1.0e3, dPhi_radm2=1.0, nSamples=100.0,
-            weightType='variance', fitRMSF=False, noStokesI=False, 
-            phiNoise_radm2=1000000.0,
-            nBits=32, showPlots=self.verbose, debug=False, verbose=self.verbose, log=print, 
-            units='Jy/beam', prefixOut='prefixOut', saveFigures=None,
-            fit_function='log'
-        )
-        
-        rmc = run_rmclean(
-            rmd, rmad, 0.1, maxIter=1000, gain=0.1, nBits=32, showPlots=self.verbose, 
-            verbose=self.verbose, log=print
-        )
-        
-        print(rmc[0])
-        
-        res	= [
-            rmc[0]['phiPeakPIfit_rm2'], rmc[0]['dPhiPeakPIfit_rm2'], 
-            rmc[0]['polAngle0Fit_deg'], rmc[0]['dPolAngle0Fit_deg']
-        ]
-        
-        return(res)	
 
+        if method == "rmtools":        
+            rmd, rmad = run_rmsynth(
+                rmtdata, polyOrd=3, phiMax_radm2=1.0e3, dPhi_radm2=1.0, nSamples=100.0,
+                weightType='variance', fitRMSF=False, noStokesI=False, 
+                phiNoise_radm2=1000000.0,
+                nBits=32, showPlots=self.verbose, debug=False, verbose=self.verbose, log=print, 
+                units='Jy/beam', prefixOut='prefixOut', saveFigures=None,
+                fit_function='log'
+            )
+            
+            rmc = run_rmclean(
+                rmd, rmad, 0.1, maxIter=1000, gain=0.1, nBits=32, showPlots=self.verbose, 
+                verbose=self.verbose, log=print
+            )
+            
+            # print(rmc[0])
+            
+            res	= [
+                rmc[0]['phiPeakPIfit_rm2'], rmc[0]['dPhiPeakPIfit_rm2'], 
+                rmc[0]['polAngle0Fit_deg'], rmc[0]['dPolAngle0Fit_deg']
+            ]
+            
+            return(res)	
+        
+        elif method == "rmnest":
+            print(self.freqs, self.f0)
+            print(self.Q_ds[t_idx], self.U_ds[t_idx], self.V_ds[t_idx])
+            print(self.Q_ds[noise_idx], self.U_ds[noise_idx], self.V_ds[noise_idx])
+            os.system("mkdir junk")
+            rmn = RMNest(freqs=self.freqs, freq_cen = self.f0, 
+                         s_q = self.Q_ds[t_idx], 
+                         s_u = self.U_ds[t_idx], 
+                         s_v = self.V_ds[t_idx],
+                         rms_q = self.Q_ds[noise_idx], 
+                         rms_u = self.U_ds[noise_idx],
+                         rms_v = self.V_ds[noise_idx],
+                        )
+            rmn.fit(gfr=False, outdir='junk')
+            rmn.print_summary()
+                
+            return(0)
+
+    def scint(self, n_chan=336, n_subbands=1, mask=None, do_scatt=True, do_scint=True,
+              tau_bounds=None, t0_bounds=None, width_bounds=None, a_bounds=None,
+              nuDC_bounds=None, C_bounds=None
+              ):
+        # make interactive plot to select pulse timing
+        print("Select start (left click) and stop (right click) times for "\
+              "scintillation analysis")
+        fig, ax = plt.subplots(nrows=2, sharex=True)
+
+        # get first time profile drops below peak/e
+        tau_guess_smp = np.argmax((self.I < self.I[self.peak]/np.e) & (np.arange(len(self.I)) > self.peak)) - self.peak
+        tau_guess_us = int(tau_guess_smp * self.dt)
+
+        def draw_plot():
+            ax[0].plot(self.I)
+            ax[0].axhline(self.I[self.peak]/np.e, c="k", ls="--")
+            ax[0].axvline(self.peak, c="k", ls="--")
+            ax[0].axvline(tau_guess_smp+self.peak, c="k", ls="--")
+
+            ax[1].imshow(self.I_ds.T, aspect="auto", interpolation="nearest")
+
+        draw_plot()
+
+        start_idx = None
+        stop_idx = None
+
+        def onclick(event):
+            nonlocal start_idx, stop_idx
+            if event.button == 1:
+                start_idx = event.xdata
+                ax[0].clear()
+                draw_plot()
+                ax[0].axvline(start_idx, c="r", ls="--")
+                if stop_idx is not None:
+                    ax[0].axvline(stop_idx, c="r", ls="--")
+                fig.canvas.draw() 
+            elif event.button == 3:
+                stop_idx = event.xdata
+                ax[0].clear()
+                draw_plot()
+                if start_idx is not None:
+                    ax[0].axvline(start_idx, c="r", ls="--")
+                ax[0].axvline(stop_idx, c="r", ls="--")
+                fig.canvas.draw() 
+        
+        cid = fig.canvas.mpl_connect('button_press_event', onclick)
+
+        plt.show()
+
+
+        t_s = self.t/1e6
+        t_s = t_s - t_s[0]
+        start_s = t_s[int(start_idx)]
+        stop_s = t_s[int(stop_idx)]
+        rise_time_us = int((t_s[self.peak] - start_s)*1e6)
+
+        print(f"Start time = {start_s} s")
+        print(f"Stop time = {stop_s} s")
+        print(f"Duration = {stop_s-start_s} s")
+        print(f"tau guess = {tau_guess_us} us")
+        print(f"rise time = {rise_time_us} us")
+
+        # default masking: get rid zapped freqs
+        if mask is None:
+            mask = np.ones(self.nchan, dtype=bool)
+            mask[np.isnan(self.I_ds).any(axis=0)] = 0
+
+            if self.nchan > n_chan:
+                mask = scrunch(mask, self.nchan//n_chan, axis=0, func=np.any)
+            elif self.nchan < n_chan:
+                mask = np.repeat(mask, n_chan//self.nchan)
+
+        # do initial rough fit to get bounds
+        # xdata = t_s[int(start_idx):int(stop_idx)]*1e6
+        # ydata = self.I[int(start_idx):int(stop_idx)]
+        # p0 = [0, xdata[0], rise_time_us/10, 1, tau_guess_us]
+        # # popt, pcov = curve_fit(scint.pulseFit, 
+        # #                        xdata, 
+        # #                        ydata, 
+        # #                        p0=p0,
+        # #                        nan_policy="omit")
+
+        # # print(popt)
+        # # print(np.diag(pcov))
+
+        # plt.figure()
+        # plt.plot(xdata, ydata)
+        # plt.plot(xdata, scint.pulseFit(xdata, *p0))
+        # # plt.plot(t_s[int(start_idx):int(stop_idx)], scint.pulseFit(t_s[int(start_idx):int(stop_idx)], *popt))
+        # plt.show()
+
+        # return
+        
+        # default bounds
+        if tau_bounds is None:
+            tau_bounds = [int(tau_guess_us*0.75)*336//n_chan, int(tau_guess_us*1.25)*336//n_chan]
+        if t0_bounds is None:
+            t0_bounds = [0, rise_time_us*2*336//n_chan]
+        if width_bounds is None:
+            width_bounds = [1, rise_time_us*2*336//n_chan]
+        if a_bounds is None:
+            a_bounds = [1, 1000]
+        if nuDC_bounds is None:
+            nuDC_bounds = [1e-4, 30]
+        if C_bounds is None:
+            C_bounds = [0.01, 5]
+
+        res = scint.ScatteringandScintillationMaster(
+            self.X_full, self.Y_full,
+            start_s, stop_s-start_s,
+            n_chan, self.name, self.f0*un.MHz,
+            n_subbands,
+            userMask=mask,
+            do_scatt=do_scatt, do_scint=do_scint,
+            tau_bounds=tau_bounds, t0_bounds=t0_bounds, 
+            width_bounds=width_bounds, a_bounds=a_bounds,
+            nuDC_bounds=nuDC_bounds, C_bounds=C_bounds,
+        )
+
+        print(res)
+        return(res)
+
+    def fit_spectrum(self, plot=True, savefig=None):
+        # fit spectrum to eq 1 of Pleunis+2021
+        # https://dx.doi.org/10.3847/1538-4357/ac33ac
+
+        spec = self.I_ds[self.peak]
+        f = self.freqs
+        f = f[~np.isnan(spec)]
+        spec = spec[~np.isnan(spec)]
+        spec_sig = np.nanstd(self.I_ds[self.off_burst], axis=0)
+        spec_sig = spec_sig[~np.isnan(spec_sig)]
+        print(spec)
+        print(spec.shape)
+        print(spec_sig)
+        print(spec_sig.shape)
+        # spec[np.isnan(spec)] = 0
+        f_piv = self.f0 - self.bw/2
+
+        model = lambda f, A, gamma, r: A*(f/f_piv)**(gamma+r*np.log(f/f_piv))
+
+        p0 = [1, -2, 0]
+
+        popt, pcov = curve_fit(model, f, spec, p0=p0, sigma=spec_sig, nan_policy="omit")
+
+        print(f"A = {popt[0]} +- {pcov[0, 0]}")
+        print(f"γ = {popt[1]} +- {pcov[1, 1]}")
+        print(f"r = {popt[2]} +- {pcov[2, 2]}")
+
+        if plot:
+            fig, ax = plt.subplots()
+            ax.plot(f, spec, "k", label="Data")
+            ax.plot(f, spec-spec_sig, "k--", label="Data")
+            ax.plot(f, spec+spec_sig, "k--", label="Data")
+            ax.plot(f, model(f, *popt), "r--", label="Fit")
+            ax.set_xlabel("Frequency (MHz)")
+            ax.set_ylabel("Flux density")
+            ax.set_title(f"FRB{self.name}")
+            ax.text(0.95, 0.95,
+                    f"$A = {popt[0]:.2f} \pm {pcov[0, 0]:.2f}$\n"\
+                    f"$\gamma = {popt[1]:.2f} \pm {pcov[1, 1]:.2f}$\n"\
+                    f"$r = {popt[2]:.2f} \pm {pcov[2, 2]:.2f}$",
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    )
+            # ax.legend()
+
+            if savefig is None:
+                plt.show()
+            else:
+                plt.savefig(savefig)
+
+    def fit_boxcar(self, n0=None, off_burst_pad=40000, n_max=10000):
+        ns = []
+        vals = []
+        stds = []
+        means = []
+
+        # use local peak because 1us series can get it wrong
+        peak = self.t.shape[0]//2
+        off_burst = np.logical_or(
+            self.t < -off_burst_pad,
+            self.t > off_burst_pad
+        )
+
+        I = ((self.I - np.mean(self.I[off_burst]))/np.std(self.I[off_burst]))
+
+        def conv_boxcar(x):
+            n=int(x[0])
+            if n in ns:
+                return vals[(np.array(ns) == n).argmax()]
+            ns.append(n)
+            boxcar = np.ones(n)/n
+            convd = np.empty(I.shape[0])
+            convd[:] = np.nan
+            convd[:-(n-1)] = np.convolve(I, boxcar, mode="valid")
+            convd = np.roll(convd, n//2)
+            convd_std = np.nanstd(convd[off_burst])
+            stds.append(convd_std)
+            convd_mean = np.nanmean(convd[off_burst])
+            means.append(convd_mean)
+            # val = -np.nanmax((convd-convd_mean)/convd_std)
+            val = -np.nanmax(convd)*np.sqrt(n)
+            vals.append(val)
+            return val
+        
+        # first pass: find initial guess (if not provided)
+        if n0 is None:
+            test_ns = np.logspace(0, np.log10(n_max), 1000, dtype=int)
+            test_ns = np.unique(test_ns)
+            test_ns = test_ns[1:]   # remove boxcar of 1
+            test_vals = [conv_boxcar([n]) for n in tqdm(test_ns)]
+            n0 = test_ns[np.argmin(test_vals)]
+            v0 = np.min(test_vals)
+    
+        print(f"Initial guess: {n0}")
+
+        # # second pass: refine
+        # res = minimize(conv_boxcar, [n0], bounds=[(2, None)],
+        #                method="Nelder-Mead")
+        # n0 = res.x[0]
+        # v0 = -res.fun
+        # print(f"Best fit: {int(res.x[0])} with S/N {-res.fun}")
+        
+        # second pass: brute force from n0//2 to 2*n0
+        res = None
+        print("Refining...")
+        while True:
+            print(f"{n0//2} --> {2*n0}")    
+            test_ns = np.arange(n0//2, 2*n0+1)
+            test_vals = [conv_boxcar([n]) for n in tqdm(test_ns)]
+            if min(test_vals) == v0:
+                break
+            else:
+                n0 = test_ns[np.argmin(test_vals)]
+                v0 = np.min(test_vals)
+
+
+        # third pass: get error bounds by going up and down until S/N
+        # reduces by 1
+        thresh = v0 + 1
+
+        def find_bound(init_step):
+            n = int(n0)
+            diff = 1
+            step = init_step
+            with tqdm(total=1) as pbar:
+                while True:
+                    n += step
+                    if n <= 1:
+                        n -= step
+                        step = init_step
+                        next
+                    val = conv_boxcar([n])
+                    old_diff = diff
+                    diff = thresh - val
+                    delta = old_diff - diff
+                    pbar.update(delta)
+                    if val > thresh:
+                        if step == init_step:
+                            break
+                        else:
+                            n -= step
+                            step = init_step
+                    else:
+                        step *= 2
+            return n
+        
+        n_up = find_bound(1)
+        n_down = find_bound(-1)
+
+        print(f"Upper bound: {n_up}")
+        print(f"Lower bound: {n_down}")
+
+        n = int(n0)
+        boxcar = np.ones(n)/n
+        convd = np.empty(I.shape[0])
+        convd[:] = np.nan
+        convd[:-(n-1)] = np.convolve(I, boxcar, mode="valid")
+        convd = np.roll(convd, n//2)
+
+        return(
+            int(n0),
+            (n_down, n_up),
+            v0, 
+            convd, 
+            ns, 
+            vals,
+            off_burst,
+            stds,
+            means
+        )
+    
+    def calc_pol_frac(self, window):
+        # calculacte polarisation fractions in provided index window
+        Q_prof = np.nansum(self.Q_ds, axis=1)
+        U_prof = np.nansum(self.U_ds, axis=1)
+        # L_prof = np.sqrt((Q_prof/np.nanstd(Q_prof[self.off_burst]))**2 \
+        #             + (U_prof/np.nanstd(U_prof[self.off_burst]))**2)
+
+        I_prof = np.nansum(self.I_ds, axis=1)
+        V_prof = np.nansum(self.V_ds, axis=1)
+
+        e_I = np.nanstd(I_prof[self.off_burst])
+        e_V = np.nanstd(V_prof[self.off_burst])
+
+        L_prof = e_I * np.sqrt(
+            (np.sqrt(Q_prof**2 + U_prof**2)/e_I)**2 - 1
+        )
+        L_prof -= np.nanmean(L_prof[self.off_burst])
+
+        e_L = np.nanstd(L_prof[self.off_burst])
+
+        # I_prof /= e_I
+        # V_prof /= e_V
+
+        n = window[1] - window[0]
+        L = np.nansum(L_prof[window[0]:window[1]])
+        I = np.nansum(I_prof[window[0]:window[1]])
+        V = np.nansum(V_prof[window[0]:window[1]])
+
+        l = L/I
+        v = V/I
+        p = np.sqrt(l**2 + v**2)
+
+        e_L = np.nanstd(L_prof[self.off_burst])
+        e_I = np.nanstd(I_prof[self.off_burst])
+        e_V = np.nanstd(V_prof[self.off_burst])
+
+        e_l = np.sqrt((e_L/L)**2 + (e_I/I)**2) * l
+        e_v = np.sqrt((e_V/V)**2 + (e_I/I)**2) * v 
+        e_p = np.sqrt(
+            (l/np.sqrt(l**2 + v**2) * e_l)**2 +
+            (v/np.sqrt(l**2 + v**2) * e_v)**2
+        )
+
+        l_prof = L_prof/I_prof
+        v_prof = V_prof/I_prof
+        p_prof = np.sqrt(l_prof**2 + v_prof**2)
+
+        return (l, e_l, l_prof), (v, e_v, v_prof), (p, e_p, p_prof)
+        
 
 # @memory.cache
 def scrunch(
@@ -1458,7 +1919,6 @@ def scrunch(
         raise ValueError("Invalid scrunch factor")
 
     if n == 1:
-        print("shorting")
         return x
     
     rem = x.shape[axis] % n
@@ -1600,6 +2060,7 @@ def calculate_stokes(
         X: np.ndarray, 
         Y: np.ndarray, 
         delta_phi: np.ndarray = None, 
+        normalise: bool = True,
         verbose: bool = False
     ) -> list:
     """Calculate Stokes parameters from X and Y arrays (time series or
@@ -1637,9 +2098,13 @@ def calculate_stokes(
             if stk == "I":
                 stds = this_stds
 
-            par = (par - this_means)/stds
+            par = (par - this_means)/stds if normalise else par - this_means
         
         pars.append(par)
+
+    # if not normalise:
+    #     for i in range(len(pars)):
+    #         pars[i] -= np.mean(pars[i])     #zero-mean Stokes
 
     if delta_phi is not None:
         if verbose:
